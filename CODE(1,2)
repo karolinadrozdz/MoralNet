@@ -1,0 +1,112 @@
+Code for the first 2 steps 
+
+import os
+import numpy as np
+import csv
+import cv2
+import torch
+import torchvision.models as models
+import torchvision.transforms as transforms
+from numpy.fft import fftshift
+import torch.nn.functional as F
+import requests
+
+# Define the image directory
+image_directory = "/home/c13212893/SMID_images_400px/img"
+
+# Load the pre-trained AlexNet model
+alexnet = models.alexnet(weights=models.AlexNet_Weights.IMAGENET1K_V1).eval()
+
+# Define a transform to match the AlexNet expected input
+transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((227, 227)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# Function to preprocess images using PyTorch transforms
+def preprocess_image(image):
+    img_tensor = transform(image)
+    return img_tensor.unsqueeze(0)  # Process each image one by one 
+
+# Function to extract color histograms from the original image
+def extract_color_histograms(image):
+    histograms = [cv2.calcHist([image], [i], None, [256], [0, 256]).flatten() for i in range(3)]
+    return np.concatenate(histograms)
+
+# Function to extract 2D spectral densities
+def extract_power_spectral_density(image):
+    gray_image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    f_transform = np.fft.fft2(gray_image)
+    f_shift = fftshift(f_transform)
+    magnitude_spectrum = 20 * np.log(np.abs(f_shift))
+    return magnitude_spectrum.flatten()
+
+# Function to extract high-level features using the loaded model
+def extract_alexnet_features(img_tensor):
+    with torch.no_grad():
+        raw_scores = alexnet(img_tensor)
+        probabilities = F.softmax(raw_scores, dim=1)
+        top_prob, top_class_id = torch.topk(probabilities, 1)
+    return top_prob.cpu().numpy(), top_class_id.cpu().numpy()
+
+# Download and load ImageNet class index
+def download_imagenet_classes():
+    url = "https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an error for bad responses
+        class_idx = response.json()
+        return {int(key): value[1] for key, value in class_idx.items()}
+    except requests.RequestException as e:
+        print(f"Error downloading ImageNet classes: {e}")
+        return {}
+
+imagenet_classes = download_imagenet_classes()
+
+# Function to detect faces using Viola-Jones
+def detect_faces(image):
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    gray_image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    faces = face_cascade.detectMultiScale(gray_image, scaleFactor=1.1, minNeighbors=5)
+    return len(faces)
+
+# CSV Output Path
+output_csv_path = '/home/c13212893/extracted_features.csv'
+
+# Iterate over each image and extract features to save in CSV
+with open(output_csv_path, mode='w', newline='') as feature_file:
+    csv_writer = csv.writer(feature_file)
+    csv_writer.writerow(['Image Name', 'Color Histograms', 'Predicted Class', 'Probability', 'Number of Faces', 'Power Spectral Density'])
+
+    for image_name in os.listdir(image_directory):
+        print("Processing:", image_name)
+        if image_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+            image_path = os.path.join(image_directory, image_name)
+            try:
+                # Read the image once and use it for all functions
+                image = cv2.imread(image_path)
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+                # Preprocess image for AlexNet features
+                img_tensor = preprocess_image(image_rgb)  # Using the RGB image for preprocessing
+
+                # Extract features
+                color_histograms = extract_color_histograms(image)  # Use the original BGR image for histograms
+                top_prob, top_class_id = extract_alexnet_features(img_tensor)
+                predicted_class_name = imagenet_classes.get(top_class_id[0][0], "Unknown")
+                num_faces = detect_faces(image)  # Use the original BGR image for face detection
+                psd = extract_power_spectral_density(image)  # Use the original BGR image for PSD
+
+                # Write features to CSV, including predicted class and probability
+                csv_writer.writerow([
+                    image_name,
+                    ' '.join(map(str, color_histograms)),
+                    predicted_class_name,
+                    str(top_prob[0][0]),
+                    num_faces,
+                    ' '.join(map(str, psd))
+                ])
+            except Exception as e:
+                print(f"Failed to process {image_name}: {e}")
